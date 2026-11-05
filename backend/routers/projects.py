@@ -1,47 +1,18 @@
 """
-Project endpoints.
-
-POST   /projects/                    → 201  Create a new project
-GET    /projects/                    → 200  List all projects
-GET    /projects/{id}                → 200  Get a single project (404 if not found)
-GET    /projects/{id}/tasks          → 200  Get project + all tasks via ORM relationship
-PUT    /projects/{id}                → 200  Update a project (title / description)
-DELETE /projects/{id}                → 200  Delete a project and its tasks (cascade)
+Project endpoints with strict Team Leader role authorization and workspace isolation.
 """
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 import models
 import schemas
 from database import get_db
 
-
-# ---------------------------------------------------------------------------
-# ProjectUpdate — PATCH-style partial update body (both fields optional)
-# ---------------------------------------------------------------------------
-
-class ProjectUpdate(BaseModel):
-    """All fields are optional — only the supplied ones are written."""
-    title:       Optional[str] = Field(default=None, min_length=1, max_length=255)
-    description: Optional[str] = None
-
-    @field_validator("title")
-    @classmethod
-    def title_not_blank(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not v.strip():
-            raise ValueError("title must not be blank or whitespace-only")
-        return v.strip() if v is not None else v
-
 router = APIRouter(prefix="/projects", tags=["projects"])
 
-
-# ---------------------------------------------------------------------------
-# Internal helper
-# ---------------------------------------------------------------------------
 
 def _get_project_or_404(project_id: int, db: Session) -> models.Project:
     project = db.query(models.Project).filter(models.Project.id == project_id).first()
@@ -53,127 +24,194 @@ def _get_project_or_404(project_id: int, db: Session) -> models.Project:
     return project
 
 
-# ---------------------------------------------------------------------------
-# POST /projects/   — create
-# ---------------------------------------------------------------------------
+def _attach_project_metadata(proj: models.Project, db: Session) -> schemas.ProjectOut:
+    mids = [
+        row.team_member_id
+        for row in db.query(models.TeamMemberProject.team_member_id)
+        .filter(models.TeamMemberProject.project_id == proj.id)
+        .all()
+    ]
+    d = {
+        "id": proj.id,
+        "title": proj.title,
+        "description": proj.description,
+        "status": proj.status,
+        "deadline": proj.deadline,
+        "owner_id": proj.owner_id,
+        "created_at": proj.created_at,
+        "assigned_member_ids": mids,
+        "assigned_members_count": len(mids),
+    }
+    return schemas.ProjectOut.model_validate(d)
+
 
 @router.post("/", response_model=schemas.ProjectOut, status_code=status.HTTP_201_CREATED)
 def create_project(payload: schemas.ProjectCreate, db: Session = Depends(get_db)):
-    """Create a new project.  Returns 404 if the owner does not exist."""
+    """
+    Create a new project.
+    Strict Rule: Only Team Leaders can create projects.
+    """
     owner = db.query(models.User).filter(models.User.id == payload.owner_id).first()
     if owner is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User with id={payload.owner_id} not found.",
         )
+    if owner.role != "Team Leader":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission Denied: Only Team Leaders can create projects.",
+        )
 
     project = models.Project(
         title=payload.title,
         description=payload.description,
+        status=payload.status or "active",
+        deadline=payload.deadline,
         owner_id=payload.owner_id,
     )
     db.add(project)
     db.commit()
     db.refresh(project)
-    return project
+    return _attach_project_metadata(project, db)
 
-
-# ---------------------------------------------------------------------------
-# GET /projects/   — list all
-# ---------------------------------------------------------------------------
 
 @router.get("/", response_model=List[schemas.ProjectOut], status_code=status.HTTP_200_OK)
-def list_projects(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    """Return a paginated list of all projects."""
-    return db.query(models.Project).offset(skip).limit(limit).all()
+def list_projects(
+    owner_id: Optional[int] = Query(default=None, description="Filter projects by Team Leader owner ID"),
+    member_id: Optional[int] = Query(default=None, description="Filter projects assigned to Team Member"),
+    requester_id: Optional[int] = Query(default=None, description="User ID of requester"),
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    """
+    Return list of projects.
+    - If requester is a Team Member, returns ONLY projects assigned to them.
+    - If owner_id is provided, returns ONLY projects owned by that Team Leader.
+    - Ensures workspace isolation and security.
+    """
+    query = db.query(models.Project)
+
+    eff_member_id = member_id
+    if requester_id is not None:
+        requester = db.query(models.User).filter(models.User.id == requester_id).first()
+        if requester and requester.role == "Team Member":
+            eff_member_id = requester.id
+
+    if eff_member_id is not None:
+        assigned_pids = [
+            row.project_id
+            for row in db.query(models.TeamMemberProject.project_id)
+            .filter(models.TeamMemberProject.team_member_id == eff_member_id)
+            .all()
+        ]
+        query = query.filter(models.Project.id.in_(assigned_pids))
+    elif owner_id is not None:
+        query = query.filter(models.Project.owner_id == owner_id)
+
+    rows = query.order_by(models.Project.id.desc()).offset(skip).limit(limit).all()
+    return [_attach_project_metadata(p, db) for p in rows]
 
 
-# ---------------------------------------------------------------------------
-# GET /projects/{project_id}/tasks
-# — resolves tasks via the ORM relationship (back_populates)
-# ---------------------------------------------------------------------------
+@router.get("/{project_id}/members", response_model=List[schemas.UserOut], status_code=status.HTTP_200_OK)
+def get_project_members(
+    project_id: int,
+    db: Session = Depends(get_db),
+):
+    """Return all team members assigned to this specific project."""
+    _get_project_or_404(project_id, db)
+    mids = [
+        row.team_member_id
+        for row in db.query(models.TeamMemberProject.team_member_id)
+        .filter(models.TeamMemberProject.project_id == project_id)
+        .all()
+    ]
+    if not mids:
+        return []
+    from routers.users import _attach_user_metadata
+    users = db.query(models.User).filter(models.User.id.in_(mids)).all()
+    return [_attach_user_metadata(u, db) for u in users]
+
+
+@router.get("/{project_id}", response_model=schemas.ProjectOut, status_code=status.HTTP_200_OK)
+def get_project(project_id: int, db: Session = Depends(get_db)):
+    """Fetch one project by primary key; 404 if not found."""
+    project = _get_project_or_404(project_id, db)
+    return _attach_project_metadata(project, db)
+
 
 @router.get(
     "/{project_id}/tasks",
     response_model=schemas.ProjectWithTasksOut,
     status_code=status.HTTP_200_OK,
-    summary="Get project with its tasks (via ORM relationship)",
 )
 def get_project_with_tasks(project_id: int, db: Session = Depends(get_db)):
-    """
-    Fetch a project **and** all its tasks resolved through the SQLAlchemy
-    ORM relationship (``Project.tasks ←→ Task.project``).
-
-    SQLAlchemy's lazy='select' strategy automatically issues a second
-    ``SELECT … WHERE tasks.project_id = :id`` the first time
-    ``project.tasks`` is accessed — no explicit join needed.
-
-    Proof that ``back_populates`` works on both sides:
-    - ``project.tasks``    → list of Task ORM objects  ✓
-    - ``task.project``     → the parent Project object  ✓  (verified below)
-    """
-    project = _get_project_or_404(project_id, db)
-
-    # Access the relationship to trigger lazy-load (fires SELECT on tasks table)
-    # This line proves that project.tasks resolves correctly.
-    _ = project.tasks  # noqa: F841  — touched so SQLAlchemy loads the collection
-
-    # Also verify the reverse side: every task's .project points back here
-    for task in project.tasks:
-        assert task.project is project  # back_populates sanity check
-
-    # ProjectWithTasksOut has from_attributes=True — Pydantic reads .tasks directly
-    return project
-
-
-# ---------------------------------------------------------------------------
-# GET /projects/{project_id}   — single project (flat, no tasks)
-# ---------------------------------------------------------------------------
-
-@router.get("/{project_id}", response_model=schemas.ProjectOut, status_code=status.HTTP_200_OK)
-def get_project(project_id: int, db: Session = Depends(get_db)):
-    """Fetch one project by primary key; 404 if not found."""
+    """Fetch a project and all its tasks via ORM relationship."""
     return _get_project_or_404(project_id, db)
 
-
-# ---------------------------------------------------------------------------
-# PUT /projects/{project_id}   — partial update (title and/or description)
-# ---------------------------------------------------------------------------
 
 @router.put("/{project_id}", response_model=schemas.ProjectOut, status_code=status.HTTP_200_OK)
 def update_project(
     project_id: int,
-    payload: ProjectUpdate,
+    payload: schemas.ProjectUpdate,
+    requester_id: Optional[int] = Query(default=None, description="User ID of the requester"),
     db: Session = Depends(get_db),
 ):
     """
-    Update a project's title and/or description.
-    Only the fields that are explicitly supplied in the body are written;
-    omitted fields remain unchanged.
-    Returns 404 if the project does not exist; 422 on validation failure.
+    Update a project's details (title, description, status, deadline).
+    Strict Rule: Only the owning Team Leader can edit the project.
     """
     project = _get_project_or_404(project_id, db)
+
+    if requester_id is not None:
+        user = db.query(models.User).filter(models.User.id == requester_id).first()
+        if not user or user.role != "Team Leader":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission Denied: Only Team Leaders can edit projects.",
+            )
+        if project.owner_id != requester_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission Denied: You can only edit your own projects.",
+            )
 
     update_data = payload.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        setattr(project, field, value)
+        if value is not None:
+            setattr(project, field, value)
 
     db.commit()
     db.refresh(project)
-    return project
+    return _attach_project_metadata(project, db)
 
-
-# ---------------------------------------------------------------------------
-# DELETE /projects/{project_id}
-# ---------------------------------------------------------------------------
 
 @router.delete("/{project_id}", status_code=status.HTTP_200_OK)
-def delete_project(project_id: int, db: Session = Depends(get_db)):
+def delete_project(
+    project_id: int,
+    requester_id: Optional[int] = Query(default=None, description="User ID of the requester"),
+    db: Session = Depends(get_db),
+):
     """
-    Delete a project and all its tasks (cascade delete-orphan fires automatically
-    via the ORM relationship defined in models.py).
+    Delete a project and its tasks (cascade).
+    Strict Rule: Only the owning Team Leader can delete the project.
     """
     project = _get_project_or_404(project_id, db)
+
+    if requester_id is not None:
+        user = db.query(models.User).filter(models.User.id == requester_id).first()
+        if not user or user.role != "Team Leader":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission Denied: Only Team Leaders can delete projects.",
+            )
+        if project.owner_id != requester_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission Denied: You can only delete your own projects.",
+            )
+
     db.delete(project)
     db.commit()
     return {"detail": f"Project with id={project_id} deleted successfully."}

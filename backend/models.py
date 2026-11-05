@@ -2,21 +2,13 @@
 SQLAlchemy ORM models.
 
 Schema:
-  users    — id (PK), name (NOT NULL), email (UNIQUE, NOT NULL), created_at
-  projects — id (PK), title (NOT NULL), description, owner_id (FK → users.id, NOT NULL)
-  tasks    — id (PK), title (NOT NULL), description, status (NOT NULL, default='todo'),
-             priority (NOT NULL, CHECK low|medium|high), due_date (TEXT, nullable),
-             project_id (FK → projects.id, NOT NULL)
-
-Relationships (both sides wired with back_populates):
-  User.projects       ←→  Project.owner        (one-to-many: User → Project)
-  Project.tasks       ←→  Task.project         (one-to-many: Project → Task)
-
-Resolves correctly:
-  a_project.tasks   → list of Task ORM objects for that project
-  a_task.project    → the parent Project ORM object
-  a_user.projects   → list of Project ORM objects owned by that user
-  a_project.owner   → the owner User ORM object
+  users         — id (PK), name, email, password, role, title, initials, color, leader_id, created_at
+  projects      — id (PK), title, description, status, deadline, owner_id (FK → users.id), created_at
+  tasks         — id (PK), title, description, status, priority, due_date, assignee, assignee_id,
+                  leader_id, project_id (FK → projects.id), created_at
+  messages      — id (PK), leader_id, sender_id, sender_name, sender_role, sender_initials,
+                  sender_color, target, message, parent_id, created_at
+  notifications — id (PK), user_id, title, content, is_read, created_at
 """
 
 from sqlalchemy import (
@@ -25,8 +17,10 @@ from sqlalchemy import (
     String,
     Text,
     DateTime,
+    Boolean,
     ForeignKey,
     CheckConstraint,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import relationship, DeclarativeBase
@@ -47,11 +41,18 @@ class User(Base):
     id         = Column(Integer, primary_key=True, index=True)
     name       = Column(String(255), nullable=False)
     email      = Column(String(255), nullable=False, unique=True, index=True)
+    password   = Column(String(255), nullable=False, default="password123")
+    role       = Column(String(50), nullable=False, default="Team Leader")
+    title      = Column(String(100), nullable=True)
+    initials   = Column(String(10), nullable=True)
+    color      = Column(String(50), nullable=True, default="av-blue")
+    phone      = Column(String(50), nullable=True)
+    bio        = Column(Text, nullable=True)
+    avatar_url = Column(Text, nullable=True)
+    leader_id  = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    # ── Relationship: one user → many projects ──────────────────────────
-    # back_populates="owner" means Project.owner resolves back to this User.
-    # cascade="all, delete-orphan": deleting a user removes all their projects.
+    # Relationship: one user → many projects
     projects = relationship(
         "Project",
         back_populates="owner",
@@ -60,7 +61,7 @@ class User(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<User id={self.id} email={self.email!r}>"
+        return f"<User id={self.id} email={self.email!r} role={self.role!r}>"
 
 
 # ===========================================================================
@@ -73,6 +74,8 @@ class Project(Base):
     id          = Column(Integer, primary_key=True, index=True)
     title       = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
+    status      = Column(String(50), nullable=True, default="active")
+    deadline    = Column(String(100), nullable=True)
     owner_id    = Column(
         Integer,
         ForeignKey("users.id", ondelete="CASCADE"),
@@ -81,17 +84,12 @@ class Project(Base):
     )
     created_at  = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    # ── Relationship: many projects → one user (back side of User.projects) ─
-    # back_populates="projects" closes the loop: project.owner → User instance
     owner = relationship(
         "User",
         back_populates="projects",
         lazy="select",
     )
 
-    # ── Relationship: one project → many tasks ───────────────────────────
-    # back_populates="project" means Task.project resolves back to this Project.
-    # cascade="all, delete-orphan": deleting a project removes all its tasks.
     tasks = relationship(
         "Task",
         back_populates="project",
@@ -100,7 +98,7 @@ class Project(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<Project id={self.id} title={self.title!r}>"
+        return f"<Project id={self.id} title={self.title!r} owner_id={self.owner_id}>"
 
 
 # ===========================================================================
@@ -110,8 +108,6 @@ class Project(Base):
 class Task(Base):
     __tablename__ = "tasks"
 
-    # Priority/status are restricted to these closed sets at the DB level
-    # (CHECK constraints below) to stay in sync with what the AI parser emits.
     PRIORITY_VALUES = ("low", "medium", "high")
     STATUS_VALUES   = ("todo", "in_progress", "done")
 
@@ -130,8 +126,10 @@ class Task(Base):
         default="medium",
         server_default="medium",
     )
-    # Stored as plain TEXT — accepts both "2024-12-31" and "next friday"
     due_date    = Column(String(100), nullable=True)
+    assignee    = Column(String(50), nullable=True)
+    assignee_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    leader_id   = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     project_id  = Column(
         Integer,
         ForeignKey("projects.id", ondelete="CASCADE"),
@@ -140,15 +138,12 @@ class Task(Base):
     )
     created_at  = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    # ── Relationship: many tasks → one project (back side of Project.tasks) ─
-    # back_populates="tasks" closes the loop: task.project → Project instance
     project = relationship(
         "Project",
         back_populates="tasks",
         lazy="select",
     )
 
-    # CHECK constraints — priority and status are enforced at the DB level
     __table_args__ = (
         CheckConstraint(
             "priority IN ('low', 'medium', 'high')",
@@ -162,3 +157,63 @@ class Task(Base):
 
     def __repr__(self) -> str:
         return f"<Task id={self.id} title={self.title!r} priority={self.priority!r}>"
+
+
+# ===========================================================================
+# Message (Chat / Directives / Announcements)
+# ===========================================================================
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    leader_id       = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    sender_id       = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    sender_name     = Column(String(255), nullable=False)
+    sender_role     = Column(String(50), nullable=False)
+    sender_initials = Column(String(10), nullable=True)
+    sender_color    = Column(String(50), nullable=True)
+    target          = Column(String(255), default="All Members")
+    message         = Column(Text, nullable=False)
+    parent_id       = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ===========================================================================
+# Notification
+# ===========================================================================
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title      = Column(String(255), nullable=False)
+    content    = Column(Text, nullable=False)
+    is_read    = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ===========================================================================
+# TeamMemberProject (Many-to-Many between Team Members and Projects)
+# ===========================================================================
+
+class TeamMemberProject(Base):
+    __tablename__ = "team_member_projects"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    team_member_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id     = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    assigned_by    = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("team_member_id", "project_id", name="uq_member_project"),
+    )
+
+    team_member = relationship("User", foreign_keys=[team_member_id], lazy="select")
+    project     = relationship("Project", foreign_keys=[project_id], lazy="select")
+    assigner    = relationship("User", foreign_keys=[assigned_by], lazy="select")
+
+    def __repr__(self) -> str:
+        return f"<TeamMemberProject id={self.id} member={self.team_member_id} project={self.project_id}>"

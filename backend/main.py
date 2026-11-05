@@ -24,7 +24,7 @@ from starlette.responses import Response
 
 from config import ALLOWED_ORIGINS
 from database import create_tables
-from routers import projects, quick_add, stats, tasks, users
+from routers import messages, projects, quick_add, stats, tasks, users
 
 # ---------------------------------------------------------------------------
 # Standard library logger — outputs to the console by default.
@@ -96,12 +96,20 @@ app.add_middleware(LoggingMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=list(set(ALLOWED_ORIGINS + [
+        "https://taskflowaiassistance.netlify.app",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+        "http://localhost:5501",
+        "http://127.0.0.1:5501",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:3000",
+    ])),
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
-    # Explicit HTTP methods — no catch-all wildcard
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    # Explicit request headers the frontend is allowed to send
-    allow_headers=["Content-Type", "Authorization", "Accept", "X-Requested-With"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
@@ -122,15 +130,28 @@ def on_startup() -> None:
 app.include_router(users.router)
 app.include_router(projects.router)
 app.include_router(tasks.router)
+app.include_router(messages.router)
 app.include_router(quick_add.router)
 app.include_router(stats.router)
 
 
 # ---------------------------------------------------------------------------
-# 5. Health-check root endpoint
+# 5. Health-check root endpoint (Supports both GET and HEAD for Render)
 # ---------------------------------------------------------------------------
 
-@app.get("/", tags=["health"])
+@app.api_route("/", methods=["GET", "HEAD"], tags=["health"])
 def health_check():
-    """Quick liveness check — returns 200 with a status message."""
+    """Quick liveness check — returns 200 with a status message for GET and HEAD."""
     return {"status": "ok", "message": "Task Manager API is running."}
+
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["health"])
+def health():
+    """Explicit /health endpoint for cloud providers like Render."""
+    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    host = os.environ.get("HOST", "0.0.0.0")
+    uvicorn.run("main:app", host=host, port=port)
